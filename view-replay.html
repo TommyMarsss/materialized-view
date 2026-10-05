@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>增量物化视图回放</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #1a2130; --border: #2c3650; --text: #e6e9f0; --dim: #8b94a8;
+    --insert: #4ade80; --update: #fbbf24; --delete: #f87171;
+    --created: #14532d; --adjusted: #713f12; --removed: #7f1d1d; --kept: #334155;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7fb; --panel:#ffffff; --border:#d8dde8; --text:#1c2333; --dim:#5b6478;
+      --created:#dcfce7; --adjusted:#fef3c7; --removed:#fee2e2; --kept:#e2e8f0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { padding:14px 20px; border-bottom:1px solid var(--border); }
+  header h1 { margin:0 0 4px; font-size:18px; }
+  header .meta { color:var(--dim); font-size:12px; }
+  .controls { display:flex; gap:8px; align-items:center; padding:12px 20px; flex-wrap:wrap;
+              border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--bg); z-index:2; }
+  button { font:inherit; padding:6px 14px; border:1px solid var(--border); border-radius:6px;
+           background:var(--panel); color:var(--text); cursor:pointer; }
+  button:hover { border-color:var(--dim); }
+  button:disabled { opacity:.4; cursor:default; }
+  input[type=range] { flex:1; min-width:120px; }
+  .badge { font-size:12px; padding:2px 10px; border-radius:99px; border:1px solid var(--border); }
+  .badge.ok { color:var(--insert); border-color:var(--insert); }
+  .badge.bad { color:var(--delete); border-color:var(--delete); }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:16px; padding:16px 20px; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px; }
+  h2 { margin:0 0 10px; font-size:14px; color:var(--dim); text-transform:uppercase; letter-spacing:.06em; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; }
+  th { color:var(--dim); font-weight:600; font-size:12px; }
+  tr.ev-created td { background:var(--created); }
+  tr.ev-adjusted td { background:var(--adjusted); }
+  tr.ev-removed td { background:var(--removed); text-decoration:line-through; }
+  tr.ev-kept td { background:var(--kept); }
+  .op { font-family:ui-monospace,Menlo,monospace; font-size:13px; padding:8px 10px; border-radius:6px;
+        border:1px solid var(--border); margin-bottom:10px; }
+  .op.insert { color:var(--insert); } .op.update { color:var(--update); } .op.delete { color:var(--delete); }
+  .events { list-style:none; margin:0; padding:0; }
+  .events li { padding:6px 10px; border-radius:6px; margin-bottom:6px; font-size:13px; border:1px solid var(--border); }
+  .events li.group_created { border-left:4px solid var(--insert); }
+  .events li.group_adjusted { border-left:4px solid var(--update); }
+  .events li.group_removed { border-left:4px solid var(--delete); }
+  .events li.group_kept { border-left:4px solid var(--dim); }
+  .events .tag { font-size:11px; color:var(--dim); margin-right:6px; text-transform:uppercase; }
+  .empty { color:var(--dim); font-style:italic; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12px; color:var(--dim); padding:0 20px 16px; }
+  .legend span::before { content:""; display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; }
+  .legend .l-created::before { background:var(--created); } .legend .l-adjusted::before { background:var(--adjusted); }
+  .legend .l-removed::before { background:var(--removed); } .legend .l-kept::before { background:var(--kept); }
+</style>
+</head>
+<body>
+<header>
+  <h1>增量物化视图维护 · 变更流回放</h1>
+  <div class="meta">分组清理策略：移除空分组（remove-empty） · 每步均与全量重算比对（黄金标准）</div>
+</header>
+<div class="controls">
+  <button id="first">⏮</button><button id="prev">◀ 上一步</button>
+  <button id="play">▶ 播放</button>
+  <button id="next">下一步 ▶</button><button id="last">⏭</button>
+  <input type="range" id="slider" min="0" max="0" value="0">
+  <span id="pos" class="badge"></span>
+  <span id="consistency" class="badge"></span>
+</div>
+<main>
+  <section>
+    <h2>当前操作</h2>
+    <div id="op" class="op"></div>
+    <h2>维护事件</h2>
+    <ul id="events" class="events"></ul>
+  </section>
+  <section>
+    <h2>聚合视图（GROUP BY group）</h2>
+    <table><thead><tr><th>分组</th><th>COUNT</th><th>SUM</th><th>AVG</th></tr></thead><tbody id="view"></tbody></table>
+    <h2 style="margin-top:16px">基表当前有效记录</h2>
+    <table><thead><tr><th>ID</th><th>分组</th><th>值</th></tr></thead><tbody id="recs"></tbody></table>
+  </section>
+</main>
+<div class="legend">
+  <span class="l-created">分组创建</span><span class="l-adjusted">聚合修正</span>
+  <span class="l-removed">分组清理</span><span class="l-kept">空分组保留</span>
+</div>
+<script>
+const STEPS = [{"index":0,"op":"INSERT #1 (A, 10)","opType":"insert","events":[{"type":"group_created","group":"A","before":{"count":0,"sum":0},"after":{"count":1,"sum":10},"detail":"分组 \"A\" 创建（记录 #1 加入）"}],"snapshot":[{"group":"A","count":1,"sum":10,"avg":10}],"records":[{"id":1,"group":"A","value":10}],"consistent":true},{"index":1,"op":"INSERT #2 (A, 20)","opType":"insert","events":[{"type":"group_adjusted","group":"A","before":{"count":1,"sum":10},"after":{"count":2,"sum":30},"detail":"记录 #2 加入分组 \"A\"：count 1→2, sum 10→30"}],"snapshot":[{"group":"A","count":2,"sum":30,"avg":15}],"records":[{"id":1,"group":"A","value":10},{"id":2,"group":"A","value":20}],"consistent":true},{"index":2,"op":"INSERT #3 (B, 5)","opType":"insert","events":[{"type":"group_created","group":"B","before":{"count":0,"sum":0},"after":{"count":1,"sum":5},"detail":"分组 \"B\" 创建（记录 #3 加入）"}],"snapshot":[{"group":"A","count":2,"sum":30,"avg":15},{"group":"B","count":1,"sum":5,"avg":5}],"records":[{"id":1,"group":"A","value":10},{"id":2,"group":"A","value":20},{"id":3,"group":"B","value":5}],"consistent":true},{"index":3,"op":"UPDATE #1 -\u003e (A, 15)","opType":"update","events":[{"type":"group_adjusted","group":"A","before":{"count":2,"sum":30},"after":{"count":1,"sum":20},"detail":"记录 #1 离开分组 \"A\"：count 2→1, sum 30→20"},{"type":"group_adjusted","group":"A","before":{"count":1,"sum":20},"after":{"count":2,"sum":35},"detail":"记录 #1 加入分组 \"A\"：count 1→2, sum 20→35"}],"snapshot":[{"group":"A","count":2,"sum":35,"avg":17.5},{"group":"B","count":1,"sum":5,"avg":5}],"records":[{"id":1,"group":"A","value":15},{"id":2,"group":"A","value":20},{"id":3,"group":"B","value":5}],"consistent":true},{"index":4,"op":"UPDATE #2 -\u003e (B, 25)","opType":"update","events":[{"type":"group_adjusted","group":"A","before":{"count":2,"sum":35},"after":{"count":1,"sum":15},"detail":"记录 #2 离开分组 \"A\"：count 2→1, sum 35→15"},{"type":"group_adjusted","group":"B","before":{"count":1,"sum":5},"after":{"count":2,"sum":30},"detail":"记录 #2 加入分组 \"B\"：count 1→2, sum 5→30"}],"snapshot":[{"group":"A","count":1,"sum":15,"avg":15},{"group":"B","count":2,"sum":30,"avg":15}],"records":[{"id":1,"group":"A","value":15},{"id":2,"group":"B","value":25},{"id":3,"group":"B","value":5}],"consistent":true},{"index":5,"op":"INSERT #4 (C, 100)","opType":"insert","events":[{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":100},"detail":"分组 \"C\" 创建（记录 #4 加入）"}],"snapshot":[{"group":"A","count":1,"sum":15,"avg":15},{"group":"B","count":2,"sum":30,"avg":15},{"group":"C","count":1,"sum":100,"avg":100}],"records":[{"id":1,"group":"A","value":15},{"id":2,"group":"B","value":25},{"id":3,"group":"B","value":5},{"id":4,"group":"C","value":100}],"consistent":true},{"index":6,"op":"DELETE #4","opType":"delete","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":100},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #4 离开，分组被清理"}],"snapshot":[{"group":"A","count":1,"sum":15,"avg":15},{"group":"B","count":2,"sum":30,"avg":15}],"records":[{"id":1,"group":"A","value":15},{"id":2,"group":"B","value":25},{"id":3,"group":"B","value":5}],"consistent":true},{"index":7,"op":"DELETE #1","opType":"delete","events":[{"type":"group_removed","group":"A","before":{"count":1,"sum":15},"after":{"count":0,"sum":0},"detail":"分组 \"A\" 最后一条记录 #1 离开，分组被清理"}],"snapshot":[{"group":"B","count":2,"sum":30,"avg":15}],"records":[{"id":2,"group":"B","value":25},{"id":3,"group":"B","value":5}],"consistent":true},{"index":8,"op":"UPDATE #3 -\u003e (A, 7)","opType":"update","events":[{"type":"group_adjusted","group":"B","before":{"count":2,"sum":30},"after":{"count":1,"sum":25},"detail":"记录 #3 离开分组 \"B\"：count 2→1, sum 30→25"},{"type":"group_created","group":"A","before":{"count":0,"sum":0},"after":{"count":1,"sum":7},"detail":"分组 \"A\" 创建（记录 #3 加入）"}],"snapshot":[{"group":"A","count":1,"sum":7,"avg":7},{"group":"B","count":1,"sum":25,"avg":25}],"records":[{"id":2,"group":"B","value":25},{"id":3,"group":"A","value":7}],"consistent":true},{"index":9,"op":"DELETE #2","opType":"delete","events":[{"type":"group_removed","group":"B","before":{"count":1,"sum":25},"after":{"count":0,"sum":0},"detail":"分组 \"B\" 最后一条记录 #2 离开，分组被清理"}],"snapshot":[{"group":"A","count":1,"sum":7,"avg":7}],"records":[{"id":3,"group":"A","value":7}],"consistent":true},{"index":10,"op":"DELETE #3","opType":"delete","events":[{"type":"group_removed","group":"A","before":{"count":1,"sum":7},"after":{"count":0,"sum":0},"detail":"分组 \"A\" 最后一条记录 #3 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":11,"op":"INSERT #1 (C, 69)","opType":"insert","events":[{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":69},"detail":"分组 \"C\" 创建（记录 #1 加入）"}],"snapshot":[{"group":"C","count":1,"sum":69,"avg":69}],"records":[{"id":1,"group":"C","value":69}],"consistent":true},{"index":12,"op":"INSERT #2 (D, 46)","opType":"insert","events":[{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":46},"detail":"分组 \"D\" 创建（记录 #2 加入）"}],"snapshot":[{"group":"C","count":1,"sum":69,"avg":69},{"group":"D","count":1,"sum":46,"avg":46}],"records":[{"id":1,"group":"C","value":69},{"id":2,"group":"D","value":46}],"consistent":true},{"index":13,"op":"DELETE #1","opType":"delete","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":69},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #1 离开，分组被清理"}],"snapshot":[{"group":"D","count":1,"sum":46,"avg":46}],"records":[{"id":2,"group":"D","value":46}],"consistent":true},{"index":14,"op":"DELETE #2","opType":"delete","events":[{"type":"group_removed","group":"D","before":{"count":1,"sum":46},"after":{"count":0,"sum":0},"detail":"分组 \"D\" 最后一条记录 #2 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":15,"op":"INSERT #3 (C, 16)","opType":"insert","events":[{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":16},"detail":"分组 \"C\" 创建（记录 #3 加入）"}],"snapshot":[{"group":"C","count":1,"sum":16,"avg":16}],"records":[{"id":3,"group":"C","value":16}],"consistent":true},{"index":16,"op":"DELETE #3","opType":"delete","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":16},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #3 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":17,"op":"INSERT #4 (C, 2)","opType":"insert","events":[{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":2},"detail":"分组 \"C\" 创建（记录 #4 加入）"}],"snapshot":[{"group":"C","count":1,"sum":2,"avg":2}],"records":[{"id":4,"group":"C","value":2}],"consistent":true},{"index":18,"op":"UPDATE #4 -\u003e (C, 35)","opType":"update","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":2},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #4 离开，分组被清理"},{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":35},"detail":"分组 \"C\" 创建（记录 #4 加入）"}],"snapshot":[{"group":"C","count":1,"sum":35,"avg":35}],"records":[{"id":4,"group":"C","value":35}],"consistent":true},{"index":19,"op":"UPDATE #4 -\u003e (E, 62)","opType":"update","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":35},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #4 离开，分组被清理"},{"type":"group_created","group":"E","before":{"count":0,"sum":0},"after":{"count":1,"sum":62},"detail":"分组 \"E\" 创建（记录 #4 加入）"}],"snapshot":[{"group":"E","count":1,"sum":62,"avg":62}],"records":[{"id":4,"group":"E","value":62}],"consistent":true},{"index":20,"op":"INSERT #5 (E, 8)","opType":"insert","events":[{"type":"group_adjusted","group":"E","before":{"count":1,"sum":62},"after":{"count":2,"sum":70},"detail":"记录 #5 加入分组 \"E\"：count 1→2, sum 62→70"}],"snapshot":[{"group":"E","count":2,"sum":70,"avg":35}],"records":[{"id":4,"group":"E","value":62},{"id":5,"group":"E","value":8}],"consistent":true},{"index":21,"op":"DELETE #4","opType":"delete","events":[{"type":"group_adjusted","group":"E","before":{"count":2,"sum":70},"after":{"count":1,"sum":8},"detail":"记录 #4 离开分组 \"E\"：count 2→1, sum 70→8"}],"snapshot":[{"group":"E","count":1,"sum":8,"avg":8}],"records":[{"id":5,"group":"E","value":8}],"consistent":true},{"index":22,"op":"INSERT #6 (A, 11)","opType":"insert","events":[{"type":"group_created","group":"A","before":{"count":0,"sum":0},"after":{"count":1,"sum":11},"detail":"分组 \"A\" 创建（记录 #6 加入）"}],"snapshot":[{"group":"A","count":1,"sum":11,"avg":11},{"group":"E","count":1,"sum":8,"avg":8}],"records":[{"id":5,"group":"E","value":8},{"id":6,"group":"A","value":11}],"consistent":true},{"index":23,"op":"DELETE #5","opType":"delete","events":[{"type":"group_removed","group":"E","before":{"count":1,"sum":8},"after":{"count":0,"sum":0},"detail":"分组 \"E\" 最后一条记录 #5 离开，分组被清理"}],"snapshot":[{"group":"A","count":1,"sum":11,"avg":11}],"records":[{"id":6,"group":"A","value":11}],"consistent":true},{"index":24,"op":"UPDATE #6 -\u003e (C, 8)","opType":"update","events":[{"type":"group_removed","group":"A","before":{"count":1,"sum":11},"after":{"count":0,"sum":0},"detail":"分组 \"A\" 最后一条记录 #6 离开，分组被清理"},{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":8},"detail":"分组 \"C\" 创建（记录 #6 加入）"}],"snapshot":[{"group":"C","count":1,"sum":8,"avg":8}],"records":[{"id":6,"group":"C","value":8}],"consistent":true},{"index":25,"op":"UPDATE #6 -\u003e (E, 61)","opType":"update","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":8},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #6 离开，分组被清理"},{"type":"group_created","group":"E","before":{"count":0,"sum":0},"after":{"count":1,"sum":61},"detail":"分组 \"E\" 创建（记录 #6 加入）"}],"snapshot":[{"group":"E","count":1,"sum":61,"avg":61}],"records":[{"id":6,"group":"E","value":61}],"consistent":true},{"index":26,"op":"UPDATE #6 -\u003e (E, 33)","opType":"update","events":[{"type":"group_removed","group":"E","before":{"count":1,"sum":61},"after":{"count":0,"sum":0},"detail":"分组 \"E\" 最后一条记录 #6 离开，分组被清理"},{"type":"group_created","group":"E","before":{"count":0,"sum":0},"after":{"count":1,"sum":33},"detail":"分组 \"E\" 创建（记录 #6 加入）"}],"snapshot":[{"group":"E","count":1,"sum":33,"avg":33}],"records":[{"id":6,"group":"E","value":33}],"consistent":true},{"index":27,"op":"DELETE #6","opType":"delete","events":[{"type":"group_removed","group":"E","before":{"count":1,"sum":33},"after":{"count":0,"sum":0},"detail":"分组 \"E\" 最后一条记录 #6 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":28,"op":"INSERT #7 (C, 10)","opType":"insert","events":[{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":10},"detail":"分组 \"C\" 创建（记录 #7 加入）"}],"snapshot":[{"group":"C","count":1,"sum":10,"avg":10}],"records":[{"id":7,"group":"C","value":10}],"consistent":true},{"index":29,"op":"INSERT #8 (C, 77)","opType":"insert","events":[{"type":"group_adjusted","group":"C","before":{"count":1,"sum":10},"after":{"count":2,"sum":87},"detail":"记录 #8 加入分组 \"C\"：count 1→2, sum 10→87"}],"snapshot":[{"group":"C","count":2,"sum":87,"avg":43.5}],"records":[{"id":7,"group":"C","value":10},{"id":8,"group":"C","value":77}],"consistent":true},{"index":30,"op":"DELETE #8","opType":"delete","events":[{"type":"group_adjusted","group":"C","before":{"count":2,"sum":87},"after":{"count":1,"sum":10},"detail":"记录 #8 离开分组 \"C\"：count 2→1, sum 87→10"}],"snapshot":[{"group":"C","count":1,"sum":10,"avg":10}],"records":[{"id":7,"group":"C","value":10}],"consistent":true},{"index":31,"op":"UPDATE #7 -\u003e (E, 79)","opType":"update","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":10},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #7 离开，分组被清理"},{"type":"group_created","group":"E","before":{"count":0,"sum":0},"after":{"count":1,"sum":79},"detail":"分组 \"E\" 创建（记录 #7 加入）"}],"snapshot":[{"group":"E","count":1,"sum":79,"avg":79}],"records":[{"id":7,"group":"E","value":79}],"consistent":true},{"index":32,"op":"INSERT #9 (B, 16)","opType":"insert","events":[{"type":"group_created","group":"B","before":{"count":0,"sum":0},"after":{"count":1,"sum":16},"detail":"分组 \"B\" 创建（记录 #9 加入）"}],"snapshot":[{"group":"B","count":1,"sum":16,"avg":16},{"group":"E","count":1,"sum":79,"avg":79}],"records":[{"id":7,"group":"E","value":79},{"id":9,"group":"B","value":16}],"consistent":true},{"index":33,"op":"UPDATE #7 -\u003e (D, 17)","opType":"update","events":[{"type":"group_removed","group":"E","before":{"count":1,"sum":79},"after":{"count":0,"sum":0},"detail":"分组 \"E\" 最后一条记录 #7 离开，分组被清理"},{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":17},"detail":"分组 \"D\" 创建（记录 #7 加入）"}],"snapshot":[{"group":"B","count":1,"sum":16,"avg":16},{"group":"D","count":1,"sum":17,"avg":17}],"records":[{"id":7,"group":"D","value":17},{"id":9,"group":"B","value":16}],"consistent":true},{"index":34,"op":"UPDATE #7 -\u003e (C, 71)","opType":"update","events":[{"type":"group_removed","group":"D","before":{"count":1,"sum":17},"after":{"count":0,"sum":0},"detail":"分组 \"D\" 最后一条记录 #7 离开，分组被清理"},{"type":"group_created","group":"C","before":{"count":0,"sum":0},"after":{"count":1,"sum":71},"detail":"分组 \"C\" 创建（记录 #7 加入）"}],"snapshot":[{"group":"B","count":1,"sum":16,"avg":16},{"group":"C","count":1,"sum":71,"avg":71}],"records":[{"id":7,"group":"C","value":71},{"id":9,"group":"B","value":16}],"consistent":true},{"index":35,"op":"DELETE #7","opType":"delete","events":[{"type":"group_removed","group":"C","before":{"count":1,"sum":71},"after":{"count":0,"sum":0},"detail":"分组 \"C\" 最后一条记录 #7 离开，分组被清理"}],"snapshot":[{"group":"B","count":1,"sum":16,"avg":16}],"records":[{"id":9,"group":"B","value":16}],"consistent":true},{"index":36,"op":"UPDATE #9 -\u003e (E, 4)","opType":"update","events":[{"type":"group_removed","group":"B","before":{"count":1,"sum":16},"after":{"count":0,"sum":0},"detail":"分组 \"B\" 最后一条记录 #9 离开，分组被清理"},{"type":"group_created","group":"E","before":{"count":0,"sum":0},"after":{"count":1,"sum":4},"detail":"分组 \"E\" 创建（记录 #9 加入）"}],"snapshot":[{"group":"E","count":1,"sum":4,"avg":4}],"records":[{"id":9,"group":"E","value":4}],"consistent":true},{"index":37,"op":"UPDATE #9 -\u003e (D, 14)","opType":"update","events":[{"type":"group_removed","group":"E","before":{"count":1,"sum":4},"after":{"count":0,"sum":0},"detail":"分组 \"E\" 最后一条记录 #9 离开，分组被清理"},{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":14},"detail":"分组 \"D\" 创建（记录 #9 加入）"}],"snapshot":[{"group":"D","count":1,"sum":14,"avg":14}],"records":[{"id":9,"group":"D","value":14}],"consistent":true},{"index":38,"op":"DELETE #9","opType":"delete","events":[{"type":"group_removed","group":"D","before":{"count":1,"sum":14},"after":{"count":0,"sum":0},"detail":"分组 \"D\" 最后一条记录 #9 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":39,"op":"INSERT #10 (A, 47)","opType":"insert","events":[{"type":"group_created","group":"A","before":{"count":0,"sum":0},"after":{"count":1,"sum":47},"detail":"分组 \"A\" 创建（记录 #10 加入）"}],"snapshot":[{"group":"A","count":1,"sum":47,"avg":47}],"records":[{"id":10,"group":"A","value":47}],"consistent":true},{"index":40,"op":"INSERT #11 (D, 83)","opType":"insert","events":[{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":83},"detail":"分组 \"D\" 创建（记录 #11 加入）"}],"snapshot":[{"group":"A","count":1,"sum":47,"avg":47},{"group":"D","count":1,"sum":83,"avg":83}],"records":[{"id":10,"group":"A","value":47},{"id":11,"group":"D","value":83}],"consistent":true},{"index":41,"op":"DELETE #11","opType":"delete","events":[{"type":"group_removed","group":"D","before":{"count":1,"sum":83},"after":{"count":0,"sum":0},"detail":"分组 \"D\" 最后一条记录 #11 离开，分组被清理"}],"snapshot":[{"group":"A","count":1,"sum":47,"avg":47}],"records":[{"id":10,"group":"A","value":47}],"consistent":true},{"index":42,"op":"DELETE #10","opType":"delete","events":[{"type":"group_removed","group":"A","before":{"count":1,"sum":47},"after":{"count":0,"sum":0},"detail":"分组 \"A\" 最后一条记录 #10 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":43,"op":"INSERT #12 (A, 76)","opType":"insert","events":[{"type":"group_created","group":"A","before":{"count":0,"sum":0},"after":{"count":1,"sum":76},"detail":"分组 \"A\" 创建（记录 #12 加入）"}],"snapshot":[{"group":"A","count":1,"sum":76,"avg":76}],"records":[{"id":12,"group":"A","value":76}],"consistent":true},{"index":44,"op":"UPDATE #12 -\u003e (D, 5)","opType":"update","events":[{"type":"group_removed","group":"A","before":{"count":1,"sum":76},"after":{"count":0,"sum":0},"detail":"分组 \"A\" 最后一条记录 #12 离开，分组被清理"},{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":5},"detail":"分组 \"D\" 创建（记录 #12 加入）"}],"snapshot":[{"group":"D","count":1,"sum":5,"avg":5}],"records":[{"id":12,"group":"D","value":5}],"consistent":true},{"index":45,"op":"DELETE #12","opType":"delete","events":[{"type":"group_removed","group":"D","before":{"count":1,"sum":5},"after":{"count":0,"sum":0},"detail":"分组 \"D\" 最后一条记录 #12 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":46,"op":"INSERT #13 (D, 63)","opType":"insert","events":[{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":63},"detail":"分组 \"D\" 创建（记录 #13 加入）"}],"snapshot":[{"group":"D","count":1,"sum":63,"avg":63}],"records":[{"id":13,"group":"D","value":63}],"consistent":true},{"index":47,"op":"DELETE #13","opType":"delete","events":[{"type":"group_removed","group":"D","before":{"count":1,"sum":63},"after":{"count":0,"sum":0},"detail":"分组 \"D\" 最后一条记录 #13 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":48,"op":"INSERT #14 (D, 32)","opType":"insert","events":[{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":32},"detail":"分组 \"D\" 创建（记录 #14 加入）"}],"snapshot":[{"group":"D","count":1,"sum":32,"avg":32}],"records":[{"id":14,"group":"D","value":32}],"consistent":true},{"index":49,"op":"DELETE #14","opType":"delete","events":[{"type":"group_removed","group":"D","before":{"count":1,"sum":32},"after":{"count":0,"sum":0},"detail":"分组 \"D\" 最后一条记录 #14 离开，分组被清理"}],"snapshot":[],"records":[],"consistent":true},{"index":50,"op":"INSERT #15 (D, 78)","opType":"insert","events":[{"type":"group_created","group":"D","before":{"count":0,"sum":0},"after":{"count":1,"sum":78},"detail":"分组 \"D\" 创建（记录 #15 加入）"}],"snapshot":[{"group":"D","count":1,"sum":78,"avg":78}],"records":[{"id":15,"group":"D","value":78}],"consistent":true}];
+const N = STEPS.length;
+let cur = -1, timer = null;
+const $ = id => document.getElementById(id);
+const fmt = v => Number.isInteger(v) ? String(v) : v.toFixed(4).replace(/0+$/,"").replace(/\.$/,"");
+const EV_LABEL = {group_created:"创建", group_adjusted:"修正", group_removed:"清理", group_kept:"保留"};
+const EV_ROW = {group_created:"ev-created", group_adjusted:"ev-adjusted", group_removed:"ev-removed", group_kept:"ev-kept"};
+
+function render() {
+  const s = cur >= 0 ? STEPS[cur] : null;
+  $("pos").textContent = "步骤 " + (cur + 1) + " / " + N;
+  $("slider").value = cur + 1;
+  $("first").disabled = $("prev").disabled = cur < 0;
+  $("next").disabled = $("last").disabled = cur >= N - 1;
+  const c = $("consistency");
+  if (!s) { c.textContent = "—"; c.className = "badge"; }
+  else { c.textContent = s.consistent ? "✓ 与全量重算一致" : "✗ 不一致"; c.className = "badge " + (s.consistent ? "ok" : "bad"); }
+  $("op").textContent = s ? s.op : "（初始状态：空视图）";
+  $("op").className = "op " + (s ? s.opType : "");
+  const ev = $("events"); ev.innerHTML = "";
+  const evts = s ? s.events : [];
+  if (!evts.length) ev.innerHTML = '<li class="empty">无事件</li>';
+  for (const e of evts) {
+    const li = document.createElement("li");
+    li.className = e.type;
+    li.innerHTML = '<span class="tag">' + EV_LABEL[e.type] + '</span>' + e.detail +
+      ' <span style="color:var(--dim)">[' + e.group + ': count ' + e.before.count + '→' + e.after.count +
+      ', sum ' + fmt(e.before.sum) + '→' + fmt(e.after.sum) + ']</span>';
+    ev.appendChild(li);
+  }
+  const changed = {};
+  for (const e of evts) changed[e.group] = EV_ROW[e.type];
+  const view = $("view"); view.innerHTML = "";
+  const rows = s ? s.snapshot : [];
+  if (!rows.length) view.innerHTML = '<tr><td colspan="4" class="empty">（视图空）</td></tr>';
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    if (changed[r.group]) tr.className = changed[r.group];
+    tr.innerHTML = "<td>" + r.group + "</td><td>" + r.count + "</td><td>" + fmt(r.sum) + "</td><td>" + fmt(r.avg) + "</td>";
+    view.appendChild(tr);
+  }
+  // 被清理的分组以删除线行展示（仅本步）
+  if (s) for (const e of s.events) if (e.type === "group_removed") {
+    const tr = document.createElement("tr");
+    tr.className = "ev-removed";
+    tr.innerHTML = "<td>" + e.group + "</td><td>0</td><td>0</td><td>—</td>";
+    view.appendChild(tr);
+  }
+  const recs = $("recs"); recs.innerHTML = "";
+  const rl = s ? s.records : [];
+  if (!rl.length) recs.innerHTML = '<tr><td colspan="3" class="empty">（无记录）</td></tr>';
+  for (const r of rl) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>#" + r.id + "</td><td>" + r.group + "</td><td>" + fmt(r.value) + "</td>";
+    recs.appendChild(tr);
+  }
+}
+function go(i) { cur = Math.max(-1, Math.min(N - 1, i)); render(); }
+function stop() { if (timer) { clearInterval(timer); timer = null; $("play").textContent = "▶ 播放"; } }
+$("first").onclick = () => { stop(); go(-1); };
+$("prev").onclick = () => { stop(); go(cur - 1); };
+$("next").onclick = () => { stop(); go(cur + 1); };
+$("last").onclick = () => { stop(); go(N - 1); };
+$("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (cur >= N - 1) go(-1);
+  $("play").textContent = "⏸ 暂停";
+  timer = setInterval(() => { if (cur >= N - 1) { stop(); return; } go(cur + 1); }, 900);
+};
+$("slider").oninput = e => { stop(); go(+e.target.value - 1); };
+$("slider").max = N;
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowLeft") go(cur - 1); else if (e.key === "ArrowRight") go(cur + 1);
+});
+render();
+</script>
+</body>
+</html>
